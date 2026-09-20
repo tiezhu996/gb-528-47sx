@@ -162,13 +162,23 @@ func seedCues(tx *gorm.DB, users map[string]auth.User, devices map[string]model.
 			dependencies = append(dependencies, dependency.ID)
 		}
 		dependenciesJSON, _ := json.Marshal(dependencies)
-		cue := model.CueDefinition{CueCode: definition.code, Name: definition.name, SequenceNo: definition.sequence, StartOffsetMS: definition.start, DurationMS: definition.duration, CueStatus: string(constants.CueLocked), Version: 4, CreatedBy: programmer.ID, ApprovedBy: &reviewer.ID, ActionsJSON: datatypes.JSON(actionsJSON), DependenciesJSON: datatypes.JSON(dependenciesJSON), ReviewNote: "Seeded locked rehearsal reference; offline planning only."}
+		pinsJSON, _ := json.Marshal([]model.DevicePin{{DeviceID: definition.action.DeviceID, DeviceCode: deviceCodeByID(devices, definition.action.DeviceID), PinnedVersion: 1}})
+		cue := model.CueDefinition{CueCode: definition.code, Name: definition.name, SequenceNo: definition.sequence, StartOffsetMS: definition.start, DurationMS: definition.duration, CueStatus: string(constants.CueLocked), Version: 4, CreatedBy: programmer.ID, ApprovedBy: &reviewer.ID, ActionsJSON: datatypes.JSON(actionsJSON), DependenciesJSON: datatypes.JSON(dependenciesJSON), DevicePinsJSON: datatypes.JSON(pinsJSON), ReviewNote: "Seeded locked rehearsal reference; offline planning only."}
 		if err := tx.Where("cue_code = ?", cue.CueCode).FirstOrCreate(&cue).Error; err != nil {
 			return fmt.Errorf("seed cue %s: %w", cue.CueCode, err)
 		}
 		created[cue.CueCode] = cue
 	}
 	return nil
+}
+
+func deviceCodeByID(devices map[string]model.RiggingDevice, id uint) string {
+	for _, device := range devices {
+		if device.ID == id {
+			return device.DeviceCode
+		}
+	}
+	return ""
 }
 
 func seedRules(tx *gorm.DB, devices map[string]model.RiggingDevice) error {

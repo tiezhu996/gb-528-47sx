@@ -15,10 +15,11 @@ import (
 type RiggingDeviceService struct {
 	devices *repository.RiggingDeviceRepository
 	rules   *repository.InterlockRuleRepository
+	cues    *repository.CueDefinitionRepository
 }
 
-func NewRiggingDeviceService(devices *repository.RiggingDeviceRepository, rules *repository.InterlockRuleRepository) *RiggingDeviceService {
-	return &RiggingDeviceService{devices: devices, rules: rules}
+func NewRiggingDeviceService(devices *repository.RiggingDeviceRepository, rules *repository.InterlockRuleRepository, cues *repository.CueDefinitionRepository) *RiggingDeviceService {
+	return &RiggingDeviceService{devices: devices, rules: rules, cues: cues}
 }
 
 func (s *RiggingDeviceService) List(page, pageSize int, status, search string) ([]dto.RiggingDeviceResponse, int64, error) {
@@ -74,11 +75,40 @@ func (s *RiggingDeviceService) Update(id uint, request dto.UpdateRiggingDeviceRe
 	current.TravelMaxM = request.TravelMaxM
 	current.SafetyZone = strings.ToLower(strings.TrimSpace(request.SafetyZone))
 	current.DeviceStatus = request.DeviceStatus
-	after := util.SummaryJSON(map[string]any{"limits": map[string]any{"max_load_kg": current.MaxLoadKG, "max_speed_ms": current.MaxSpeedMS, "travel_min_m": current.TravelMinM, "travel_max_m": current.TravelMaxM}, "safety_zone": current.SafetyZone, "status": current.DeviceStatus, "version": request.Version + 1})
+	invalidated, invalidateErr := s.cuesInvalidatedBy(id, current.Version)
+	if invalidateErr != nil {
+		return dto.RiggingDeviceResponse{}, invalidateErr
+	}
+	after := util.SummaryJSON(map[string]any{"limits": map[string]any{"max_load_kg": current.MaxLoadKG, "max_speed_ms": current.MaxSpeedMS, "travel_min_m": current.TravelMinM, "travel_max_m": current.TravelMaxM}, "safety_zone": current.SafetyZone, "status": current.DeviceStatus, "version": request.Version + 1, "invalidates_cues": invalidated})
 	if err := s.devices.Update(&current, request.Version, audit.NewEvent(actor, "rigging_device.update_limits", "rigging_device", id, before, after)); err != nil {
 		return dto.RiggingDeviceResponse{}, err
 	}
 	return s.withRules(current)
+}
+
+// cuesInvalidatedBy lists approved or locked cues whose approval pins
+// reference this device at the revision that is about to be replaced. The
+// device update keeps them intact but makes them stale until re-approval,
+// and the audit trail records exactly which cues are affected.
+func (s *RiggingDeviceService) cuesInvalidatedBy(deviceID uint, replacedVersion uint) ([]map[string]any, error) {
+	candidates, err := s.cues.ApprovedWithPins()
+	if err != nil {
+		return nil, err
+	}
+	invalidated := []map[string]any{}
+	for _, candidate := range candidates {
+		pins, pinErr := dto.DecodeDevicePins(candidate)
+		if pinErr != nil {
+			return nil, pinErr
+		}
+		for _, pin := range pins {
+			if pin.DeviceID == deviceID && pin.PinnedVersion == replacedVersion {
+				invalidated = append(invalidated, map[string]any{"cue_code": candidate.CueCode, "cue_version": candidate.Version, "pinned_device_version": pin.PinnedVersion})
+				break
+			}
+		}
+	}
+	return invalidated, nil
 }
 
 func (s *RiggingDeviceService) withRules(item model.RiggingDevice) (dto.RiggingDeviceResponse, error) {

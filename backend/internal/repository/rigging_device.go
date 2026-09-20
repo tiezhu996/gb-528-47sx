@@ -9,7 +9,9 @@ import (
 	"stage-rigging-cue-interlock/backend/internal/model"
 	"stage-rigging-cue-interlock/backend/internal/util"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type RiggingDeviceRepository struct {
@@ -92,6 +94,12 @@ func (r *RiggingDeviceRepository) Create(item *model.RiggingDevice, event audit.
 
 func (r *RiggingDeviceRepository) Update(item *model.RiggingDevice, expectedVersion uint, event audit.Event) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := lockRiggingDevices(tx, r.db.Dialector.Name(), []uint{item.ID}); err != nil {
+			if isLockBusy(err) {
+				return util.Conflict("DEVICE_UPDATE_BUSY", "device limits are locked by a concurrent cue approval; retry the update", err)
+			}
+			return err
+		}
 		updates := map[string]any{"name": item.Name, "device_type": item.DeviceType, "max_load_kg": item.MaxLoadKG, "max_speed_ms": item.MaxSpeedMS, "travel_min_m": item.TravelMinM, "travel_max_m": item.TravelMaxM, "safety_zone": item.SafetyZone, "device_status": item.DeviceStatus, "version": expectedVersion + 1}
 		result := tx.Model(&model.RiggingDevice{}).Where("id = ? AND version = ?", item.ID, expectedVersion).Updates(updates)
 		if result.Error != nil {
@@ -106,6 +114,42 @@ func (r *RiggingDeviceRepository) Update(item *model.RiggingDevice, expectedVers
 		item.Version = expectedVersion + 1
 		return nil
 	})
+}
+
+// lockRiggingDevices takes row-level locks on the given devices inside tx so
+// a device limit update and a cue approval cannot interleave halfway. On
+// PostgreSQL the lock is acquired with NOWAIT: a concurrent holder makes the
+// caller fail fast with a conflict instead of waiting and committing on top
+// of a half-visible change. SQLite serializes writers through its single
+// connection, so no locking clause is emitted there.
+func lockRiggingDevices(tx *gorm.DB, dialect string, ids []uint) error {
+	if len(ids) == 0 || dialect != "postgres" {
+		return nil
+	}
+	ordered := append([]uint(nil), ids...)
+	for index := 1; index < len(ordered); index++ {
+		for cursor := index; cursor > 0 && ordered[cursor] < ordered[cursor-1]; cursor-- {
+			ordered[cursor], ordered[cursor-1] = ordered[cursor-1], ordered[cursor]
+		}
+	}
+	var locked []uint
+	if err := tx.Model(&model.RiggingDevice{}).Clauses(clause.Locking{Strength: "UPDATE", Options: "NOWAIT"}).Where("id IN ?", ordered).Order("id ASC").Pluck("id", &locked).Error; err != nil {
+		return fmt.Errorf("lock rigging devices for update: %w", err)
+	}
+	if len(locked) != len(uniqueIDs(ids)) {
+		return util.Unprocessable("DEVICE_REFERENCE_INVALID", "one or more referenced devices do not exist", map[string]any{"requested_ids": ids, "found_count": len(locked)})
+	}
+	return nil
+}
+
+// isLockBusy reports whether err is PostgreSQL's lock_not_available (55P03)
+// raised by a NOWAIT row lock contending with an in-flight transaction.
+func isLockBusy(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "55P03"
+	}
+	return false
 }
 
 func uniqueIDs(ids []uint) map[uint]struct{} {

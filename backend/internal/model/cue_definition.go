@@ -19,9 +19,19 @@ type CueDefinition struct {
 	ApprovedBy       *uint
 	ActionsJSON      datatypes.JSON `gorm:"type:jsonb;not null"`
 	DependenciesJSON datatypes.JSON `gorm:"type:jsonb;not null"`
+	DevicePinsJSON   datatypes.JSON `gorm:"type:jsonb;not null;default:'[]'"`
 	ReviewNote       string         `gorm:"size:500"`
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 }
 
 func (CueDefinition) TableName() string { return "cue_definitions" }
+
+// DevicePin records the exact rigging device revision a cue approval was
+// reviewed against. Pins are captured inside the approval transaction and
+// compared with current device versions before locking or rehearsing a cue.
+type DevicePin struct {
+	DeviceID      uint   `json:"device_id"`
+	DeviceCode    string `json:"device_code"`
+	PinnedVersion uint   `json:"pinned_version"`
+}

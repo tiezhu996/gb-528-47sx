@@ -69,24 +69,27 @@ func (s *RehearsalRunService) Run(request dto.RunRehearsalRequest, actor audit.A
 	if err != nil {
 		return dto.RehearsalRunResponse{}, err
 	}
+	deviceModels, err := s.devices.All()
+	if err != nil {
+		return dto.RehearsalRunResponse{}, err
+	}
 	cueInputs := make([]interlock.CueInput, 0, len(cueModels))
 	for _, cueModel := range cueModels {
 		if constants.CueStatus(cueModel.CueStatus) != constants.CueLocked {
 			return dto.RehearsalRunResponse{}, util.Unprocessable("CUE_NOT_LOCKED", "only approved and locked cue versions may be rehearsed", map[string]any{"cue_code": cueModel.CueCode, "cue_status": cueModel.CueStatus, "version": cueModel.Version})
 		}
-		cueResponse, mapErr := dto.CueFromModel(cueModel)
+		cueResponse, mapErr := dto.CueFromModel(cueModel, deviceModels)
 		if mapErr != nil {
 			return dto.RehearsalRunResponse{}, mapErr
+		}
+		if len(cueResponse.StaleDevices) > 0 {
+			return dto.RehearsalRunResponse{}, util.Unprocessable("CUE_DEVICE_STALE", "referenced device limits changed after approval; re-approve the cue before rehearsing it again", map[string]any{"cue_code": cueModel.CueCode, "cue_version": cueModel.Version, "stale_devices": cueResponse.StaleDevices})
 		}
 		actions := make([]interlock.ActionInput, 0, len(cueResponse.Actions))
 		for _, action := range cueResponse.Actions {
 			actions = append(actions, interlock.ActionInput{DeviceID: action.DeviceID, StartOffsetMS: action.StartOffsetMS, DurationMS: action.DurationMS, FromPositionM: action.FromPositionM, ToPositionM: action.ToPositionM, LoadKG: action.LoadKG})
 		}
 		cueInputs = append(cueInputs, interlock.CueInput{GraphCue: interlock.GraphCue{ID: cueResponse.ID, CueCode: cueResponse.CueCode, SequenceNo: cueResponse.SequenceNo, StartOffsetMS: cueResponse.StartOffsetMS, DurationMS: cueResponse.DurationMS, DependencyIDs: cueResponse.DependencyIDs}, Version: cueResponse.Version, Actions: actions})
-	}
-	deviceModels, err := s.devices.All()
-	if err != nil {
-		return dto.RehearsalRunResponse{}, err
 	}
 	deviceInputs := make([]interlock.DeviceInput, 0, len(deviceModels))
 	for _, device := range deviceModels {

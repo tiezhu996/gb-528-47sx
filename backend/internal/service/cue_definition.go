@@ -29,9 +29,13 @@ func (s *CueDefinitionService) List(page, pageSize int, status, search string) (
 	if err != nil {
 		return nil, 0, err
 	}
+	devices, err := s.devices.All()
+	if err != nil {
+		return nil, 0, err
+	}
 	responses := make([]dto.CueDefinitionResponse, 0, len(items))
 	for _, item := range items {
-		response, mapErr := dto.CueFromModel(item)
+		response, mapErr := dto.CueFromModel(item, devices)
 		if mapErr != nil {
 			return nil, 0, mapErr
 		}
@@ -45,7 +49,11 @@ func (s *CueDefinitionService) Get(id uint) (dto.CueDefinitionResponse, error) {
 	if err != nil {
 		return dto.CueDefinitionResponse{}, err
 	}
-	return dto.CueFromModel(item)
+	devices, err := s.devices.All()
+	if err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	return dto.CueFromModel(item, devices)
 }
 
 func (s *CueDefinitionService) Create(request dto.CreateCueRequest, actor audit.ActorContext) (dto.CueDefinitionResponse, error) {
@@ -56,12 +64,12 @@ func (s *CueDefinitionService) Create(request dto.CreateCueRequest, actor audit.
 	if err != nil {
 		return dto.CueDefinitionResponse{}, err
 	}
-	item := model.CueDefinition{CueCode: normalizeCode(request.CueCode), Name: strings.TrimSpace(request.Name), SequenceNo: request.SequenceNo, StartOffsetMS: request.StartOffsetMS, DurationMS: request.DurationMS, CueStatus: string(constants.CueDraft), Version: 1, CreatedBy: actor.ID, ActionsJSON: actionsJSON, DependenciesJSON: dependenciesJSON}
+	item := model.CueDefinition{CueCode: normalizeCode(request.CueCode), Name: strings.TrimSpace(request.Name), SequenceNo: request.SequenceNo, StartOffsetMS: request.StartOffsetMS, DurationMS: request.DurationMS, CueStatus: string(constants.CueDraft), Version: 1, CreatedBy: actor.ID, ActionsJSON: actionsJSON, DependenciesJSON: dependenciesJSON, DevicePinsJSON: datatypes.JSON([]byte("[]"))}
 	after := cueSummary(item, request.Actions, request.DependencyIDs)
 	if err := s.cues.Create(&item, audit.NewEvent(actor, "cue_definition.create", "cue_definition", 0, "{}", after)); err != nil {
 		return dto.CueDefinitionResponse{}, err
 	}
-	return dto.CueFromModel(item)
+	return dto.CueFromModel(item, nil)
 }
 
 func (s *CueDefinitionService) Update(id uint, request dto.UpdateCueRequest, actor audit.ActorContext) (dto.CueDefinitionResponse, error) {
@@ -75,7 +83,7 @@ func (s *CueDefinitionService) Update(id uint, request dto.UpdateCueRequest, act
 	if constants.CueStatus(current.CueStatus) != constants.CueDraft {
 		return dto.CueDefinitionResponse{}, util.Unprocessable("CUE_NOT_EDITABLE", "only draft cues can be edited", map[string]any{"current_status": current.CueStatus})
 	}
-	beforeResponse, err := dto.CueFromModel(current)
+	beforeResponse, err := dto.CueFromModel(current, nil)
 	if err != nil {
 		return dto.CueDefinitionResponse{}, err
 	}
@@ -93,7 +101,7 @@ func (s *CueDefinitionService) Update(id uint, request dto.UpdateCueRequest, act
 	if err := s.cues.Update(&current, request.Version, audit.NewEvent(actor, "cue_definition.update", "cue_definition", id, util.SummaryJSON(beforeResponse), after)); err != nil {
 		return dto.CueDefinitionResponse{}, err
 	}
-	return dto.CueFromModel(current)
+	return dto.CueFromModel(current, nil)
 }
 
 func (s *CueDefinitionService) Transition(id uint, request dto.CueTransitionRequest, target constants.CueStatus, actor audit.ActorContext) (dto.CueDefinitionResponse, error) {
@@ -105,17 +113,108 @@ func (s *CueDefinitionService) Transition(id uint, request dto.CueTransitionRequ
 	if !constants.CanTransitionCue(from, target) {
 		return dto.CueDefinitionResponse{}, util.Unprocessable("INVALID_CUE_TRANSITION", fmt.Sprintf("cannot transition cue from %s to %s", from, target), map[string]any{"from": from, "to": target})
 	}
-	var reviewerID *uint
 	if target == constants.CueApproved {
-		reviewerID = &actor.ID
+		return s.approve(current, request, actor)
 	}
+	devices, err := s.devices.All()
+	if err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	if target == constants.CueLocked {
+		if err := s.requireFreshPins(current, devices); err != nil {
+			return dto.CueDefinitionResponse{}, err
+		}
+	}
+	var reviewerID *uint
 	before := util.SummaryJSON(map[string]any{"cue_status": from, "version": current.Version, "approved_by": current.ApprovedBy})
 	after := util.SummaryJSON(map[string]any{"cue_status": target, "version": request.Version + 1, "review_reason": request.Reason, "reviewer_id": reviewerID})
 	updated, err := s.cues.Transition(id, request.Version, from, target, reviewerID, strings.TrimSpace(request.Reason), audit.NewEvent(actor, "cue_definition.transition", "cue_definition", id, before, after))
 	if err != nil {
 		return dto.CueDefinitionResponse{}, err
 	}
-	return dto.CueFromModel(updated)
+	return dto.CueFromModel(updated, devices)
+}
+
+// approve pins the current revision of every action-referenced device while
+// the cue moves to approved. Pin capture and the status write commit in one
+// transaction; a concurrent device update makes the approval fail instead of
+// recording revisions that were already superseded.
+func (s *CueDefinitionService) approve(current model.CueDefinition, request dto.CueTransitionRequest, actor audit.ActorContext) (dto.CueDefinitionResponse, error) {
+	parsed, err := dto.CueFromModel(current, nil)
+	if err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	devices, err := s.devices.ByIDs(dto.ActionDeviceIDs(parsed.Actions))
+	if err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	pins := buildDevicePins(devices)
+	existingPins, err := dto.DecodeDevicePins(current)
+	if err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	before := util.SummaryJSON(map[string]any{"cue_status": current.CueStatus, "version": current.Version, "device_pins": existingPins})
+	after := util.SummaryJSON(map[string]any{"cue_status": constants.CueApproved, "version": request.Version + 1, "reviewer_id": actor.ID, "review_reason": request.Reason, "device_pins": pins})
+	updated, err := s.cues.ApproveWithDevicePins(current.ID, request.Version, pins, actor.ID, strings.TrimSpace(request.Reason), audit.NewEvent(actor, "cue_definition.approve", "cue_definition", current.ID, before, after))
+	if err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	return dto.CueFromModel(updated, devices)
+}
+
+// Reapprove refreshes the device pins of an approved or locked cue whose
+// referenced devices moved to a new revision. The cue content and status are
+// left untouched; historical approvals and rehearsal runs stay as recorded.
+func (s *CueDefinitionService) Reapprove(id uint, request dto.CueTransitionRequest, actor audit.ActorContext) (dto.CueDefinitionResponse, error) {
+	current, err := s.cues.Get(id)
+	if err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	status := constants.CueStatus(current.CueStatus)
+	if status != constants.CueApproved && status != constants.CueLocked {
+		return dto.CueDefinitionResponse{}, util.Unprocessable("CUE_NOT_REAPPROVABLE", "only approved or locked cues can be re-approved for device drift", map[string]any{"current_status": status})
+	}
+	parsed, err := dto.CueFromModel(current, nil)
+	if err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	devices, err := s.devices.ByIDs(dto.ActionDeviceIDs(parsed.Actions))
+	if err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	stale := dto.StaleDevices(parsed.DevicePins, dto.ActionDeviceIDs(parsed.Actions), devices)
+	if len(stale) == 0 {
+		return dto.CueDefinitionResponse{}, util.Unprocessable("CUE_DEVICE_PINS_CURRENT", "device pins already match the current device revisions", map[string]any{"device_pins": parsed.DevicePins})
+	}
+	pins := buildDevicePins(devices)
+	before := util.SummaryJSON(map[string]any{"cue_status": status, "version": current.Version, "device_pins": parsed.DevicePins, "stale_devices": stale})
+	after := util.SummaryJSON(map[string]any{"cue_status": status, "version": request.Version + 1, "reviewer_id": actor.ID, "review_reason": request.Reason, "device_pins": pins, "content_unchanged": true})
+	updated, err := s.cues.RefreshDevicePins(id, request.Version, pins, actor.ID, strings.TrimSpace(request.Reason), audit.NewEvent(actor, "cue_definition.reapprove", "cue_definition", id, before, after))
+	if err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	return dto.CueFromModel(updated, devices)
+}
+
+// requireFreshPins blocks locking (and, through the rehearsal service,
+// re-evaluation) of a cue whose pinned device revisions have drifted.
+func (s *CueDefinitionService) requireFreshPins(current model.CueDefinition, devices []model.RiggingDevice) error {
+	parsed, err := dto.CueFromModel(current, devices)
+	if err != nil {
+		return err
+	}
+	if len(parsed.StaleDevices) == 0 {
+		return nil
+	}
+	return util.Unprocessable("CUE_DEVICE_STALE", "referenced device limits changed after approval; re-approve the cue to pin the current revisions", map[string]any{"cue_code": current.CueCode, "cue_version": current.Version, "stale_devices": parsed.StaleDevices})
+}
+
+func buildDevicePins(devices []model.RiggingDevice) []model.DevicePin {
+	pins := make([]model.DevicePin, 0, len(devices))
+	for _, device := range devices {
+		pins = append(pins, model.DevicePin{DeviceID: device.ID, DeviceCode: device.DeviceCode, PinnedVersion: device.Version})
+	}
+	return pins
 }
 
 func (s *CueDefinitionService) validateCueInput(selfID uint, duration int64, actions []dto.CueAction, dependencyIDs []uint) error {

@@ -79,6 +79,25 @@ func (h *CueDefinitionHandler) Reject(c *gin.Context)  { h.transition(c, constan
 func (h *CueDefinitionHandler) Lock(c *gin.Context)    { h.transition(c, constants.CueLocked) }
 func (h *CueDefinitionHandler) Archive(c *gin.Context) { h.transition(c, constants.CueArchived) }
 
+func (h *CueDefinitionHandler) Reapprove(c *gin.Context) {
+	id, err := util.ParseID(c, "id")
+	if err != nil {
+		util.Fail(c, err)
+		return
+	}
+	var request dto.CueTransitionRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		util.Fail(c, util.BadRequest("VALIDATION_ERROR", "version and review reason are required", err.Error()))
+		return
+	}
+	item, err := h.service.Reapprove(id, request, audit.ActorFromContext(c))
+	if err != nil {
+		util.Fail(c, err)
+		return
+	}
+	util.OK(c, item)
+}
+
 func (h *CueDefinitionHandler) transition(c *gin.Context, target constants.CueStatus) {
 	id, err := util.ParseID(c, "id")
 	if err != nil {

@@ -16,3 +16,7 @@ export async function updateCue(id: number, input: UpdateCueInput): Promise<CueD
 export async function transitionCue(id: number, action: 'submit' | 'approve' | 'reject' | 'lock' | 'archive', version: number, reason: string): Promise<CueDefinition> {
   return (await api<CueDefinition>(`/cues/${id}/${action}`, json('POST', { version, reason }))).data
 }
+
+export async function reapproveCue(id: number, version: number, reason: string): Promise<CueDefinition> {
+  return (await api<CueDefinition>(`/cues/${id}/reapprove`, json('POST', { version, reason }))).data
+}

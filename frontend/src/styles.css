@@ -140,6 +140,12 @@ code, pre { font-family: "SFMono-Regular", Consolas, monospace; }
 .action-position > svg { margin-top: 4px; color: var(--muted); }
 .transition-desk { margin-top: 24px; padding-top: 18px; border-top: 2px solid var(--ink); }
 .transition-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.drift-tag { margin-left: 6px; vertical-align: middle; }
+.stale-alert { margin-bottom: 12px; }
+.stale-list { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 4px; }
+.stale-list li { font-size: .78rem; line-height: 1.4; }
+.stale-list li strong { margin-right: 8px; }
+.stale-list li span { color: var(--muted); }
 
 .rule-list { border-top: 1px solid var(--line-strong); }
 .rule-row { width: 100%; min-height: 76px; display: grid; grid-template-columns: 110px minmax(0, 1fr) 70px auto; align-items: center; gap: 12px; padding: 12px 10px; color: var(--ink); background: transparent; border: 0; border-bottom: 1px solid var(--line); text-align: left; cursor: pointer; }

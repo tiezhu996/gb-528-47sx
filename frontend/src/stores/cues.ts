@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import * as api from '../api/cues'
 import { errorMessage } from '../api/client'
+import { isDeviceStale } from '../types/cue'
 import type { CreateCueInput, CueDefinition, UpdateCueInput } from '../types/cue'
 
 export const useCueStore = defineStore('cues', () => {
@@ -9,6 +10,8 @@ export const useCueStore = defineStore('cues', () => {
   const loading = ref(false)
   const error = ref('')
   const locked = computed(() => items.value.filter((item) => item.cue_status === 'locked'))
+  const stale = computed(() => items.value.filter((item) => isDeviceStale(item)))
+  const rehearsable = computed(() => locked.value.filter((item) => !isDeviceStale(item)))
 
   async function load() {
     loading.value = true
@@ -41,11 +44,17 @@ export const useCueStore = defineStore('cues', () => {
     return updated
   }
 
+  async function reapprove(id: number, version: number, reason: string) {
+    const updated = await api.reapproveCue(id, version, reason)
+    upsert(updated)
+    return updated
+  }
+
   function upsert(cue: CueDefinition) {
     const existing = items.value.some((item) => item.id === cue.id)
     items.value = existing ? items.value.map((item) => (item.id === cue.id ? cue : item)) : [...items.value, cue]
     items.value.sort((a, b) => a.sequence_no - b.sequence_no || a.cue_code.localeCompare(b.cue_code))
   }
 
-  return { items, locked, loading, error, load, create, update, transition }
+  return { items, locked, stale, rehearsable, loading, error, load, create, update, transition, reapprove }
 })

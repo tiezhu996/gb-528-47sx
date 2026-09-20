@@ -38,6 +38,7 @@ docker compose down -v --remove-orphans
 
 - `RiggingDevice`：设备代码、类型、载荷/速度/行程、安全区、状态和乐观锁版本；设备页同时展示适用规则。
 - `CueDefinition`：序号、绝对起始时间、时长、动作 JSON、依赖 JSON、创建人、批准人和完整状态流。
+- Cue 设备版本锁：批准 Cue 时在同一事务内锁定并记录动作引用设备的当前版本（`device_pins`）；设备参数变化后历史批准与推演结果全部保留，但该 Cue 不能锁定或再次推演，接口以 `stale_devices` 指出失效设备及旧/新版本；复核员用 `POST /cues/:id/reapprove` 对同内容重新审批后恢复。设备更新与 Cue 审批通过行锁（PostgreSQL `FOR UPDATE NOWAIT`）保证并发时只有一方成功，失败方整体回滚。
 - `InterlockRule`：负载、速度、行程、安全区互斥和依赖间隔五类规则，保存设备范围、结构化阈值、严重度、启停与规则版本。
 - `RehearsalRun`：不可覆盖的 Cue/规则版本快照、动作时间线、规则结果、碰撞窗口、最高严重度与人工复核记录。
 - 五个业务页：设备模型、Cue 编排、联锁规则、离线推演、审计复核；共享时间线和证据表只消费真实 API。
@@ -91,6 +92,7 @@ draft -> pending_review -> approved -> locked -> archived
 | `GET/POST` | `/api/v1/cues` | Cue 列表、创建草稿 |
 | `GET/PUT` | `/api/v1/cues/:id` | Cue 详情、草稿动作更新 |
 | `POST` | `/api/v1/cues/:id/{submit,approve,reject,lock,archive}` | 事务化 Cue 状态迁移 |
+| `POST` | `/api/v1/cues/:id/reapprove` | 复核员对失效 Cue 重新审批并刷新设备版本锁 |
 | `GET/POST` | `/api/v1/rules` | 规则列表、创建规则 |
 | `GET/PUT` | `/api/v1/rules/:id` | 规则详情、版本化阈值更新 |
 | `POST` | `/api/v1/rules/:id/toggle` | 复核员启停规则 |
@@ -102,7 +104,7 @@ draft -> pending_review -> approved -> locked -> archived
 | `GET` | `/api/v1/rehearsals/:id/compare?other_id=` | 比较两个运行版本 |
 | `GET` | `/api/v1/audit-events` | 复核员读取追加式审计事件 |
 
-统一响应包含 `data`（列表另含 `meta`）和 `request_id`；错误包含 `error.code`、`error.message`、可选 `error.details` 与 `request_id`。主要错误码包括 `CUE_DEPENDENCY_CYCLE`、`MISSING_CUE_DEPENDENCY`、`DUPLICATE_CUE_SEQUENCE`、`ACTION_OUT_OF_CUE_BOUNDS`、`CUE_NOT_LOCKED`、`BLOCKER_RUN_NOT_APPROVABLE`、各实体版本冲突、`AUTH_REQUIRED` 与 `FORBIDDEN`。
+统一响应包含 `data`（列表另含 `meta`）和 `request_id`；错误包含 `error.code`、`error.message`、可选 `error.details` 与 `request_id`。主要错误码包括 `CUE_DEPENDENCY_CYCLE`、`MISSING_CUE_DEPENDENCY`、`DUPLICATE_CUE_SEQUENCE`、`ACTION_OUT_OF_CUE_BOUNDS`、`CUE_NOT_LOCKED`、`CUE_DEVICE_STALE`（锁定/推演时设备版本已漂移，`details.stale_devices` 含设备与旧/新版本）、`CUE_DEVICE_VERSION_DRIFT` 与 `CUE_DEVICE_LOCK_BUSY`（审批与设备更新并发冲突，重试即可）、`CUE_DEVICE_PINS_CURRENT`（无需重新审批）、`DEVICE_UPDATE_BUSY`、`BLOCKER_RUN_NOT_APPROVABLE`、各实体版本冲突、`AUTH_REQUIRED` 与 `FORBIDDEN`。
 
 ## 技术栈与结构
 
@@ -160,6 +162,8 @@ docker compose config --quiet
 - Compose 服务未变为 healthy：执行 `docker compose logs db backend frontend`，优先检查 PostgreSQL DSN、JWT 密钥长度和 Nginx 代理。
 - 返回 `CUE_DEPENDENCY_CYCLE`：查看 `error.details.evidence_path`，它包含闭合循环路径；修改草稿依赖并重新走复核/锁定。
 - 返回 `CUE_NOT_LOCKED`：所选 Cue 仍是草稿、待审或仅批准状态，需安全复核员锁定该明确版本。
+- 返回 `CUE_DEVICE_STALE`：设备限制在批准后发生变化。Cue 页会列出失效设备及旧/新版本，安全复核员执行 `reapprove`（内容不变、仅刷新设备版本锁）后即可重新锁定或推演；历史批准与推演记录不受影响。
+- 返回 `CUE_DEVICE_VERSION_DRIFT` / `DEVICE_UPDATE_BUSY`：设备更新与 Cue 审批并发冲突，失败方未写入任何数据，刷新后重试即可。
 - 返回 `BLOCKER_RUN_NOT_SUBMITTABLE`：打开推演证据表，按规则编号、设备和时间窗口修正新 Cue 版本；历史运行不会被覆盖。
 - 返回 409 版本冲突：刷新实体后基于最新 `version` 或 `rule_version` 重试，不要复用旧表单版本。
 

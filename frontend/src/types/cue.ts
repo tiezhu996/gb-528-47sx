@@ -9,6 +9,22 @@ export interface CueAction {
   load_kg: number
 }
 
+export interface DevicePin {
+  device_id: number
+  device_code: string
+  pinned_version: number
+}
+
+export type StaleDeviceReason = 'device_version_changed' | 'device_not_pinned'
+
+export interface StaleDevice {
+  device_id: number
+  device_code: string
+  pinned_version: number
+  current_version: number
+  reason: StaleDeviceReason
+}
+
 export interface CueDefinition {
   id: number
   cue_code: string
@@ -22,10 +38,14 @@ export interface CueDefinition {
   approved_by: number | null
   actions: CueAction[]
   dependency_ids: number[]
+  device_pins: DevicePin[]
+  stale_devices: StaleDevice[]
   review_note: string
   created_at: string
   updated_at: string
 }
+
+export const isDeviceStale = (cue: CueDefinition): boolean => (cue.stale_devices ?? []).length > 0
 
 export interface CreateCueInput {
   cue_code: string

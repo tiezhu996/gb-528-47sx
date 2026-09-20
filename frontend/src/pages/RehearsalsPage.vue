@@ -9,6 +9,7 @@ import { errorMessage } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { useRehearsalRun } from '../hooks/useRehearsalRun'
 import { useCueStore } from '../stores/cues'
+import { isDeviceStale } from '../types/cue'
 import type { RehearsalRun } from '../types/rehearsal'
 import { formatTimestamp } from '../utils/timeline'
 
@@ -57,7 +58,7 @@ async function review(decision: 'approve' | 'reject') {
 
 onMounted(async () => {
   await Promise.all([cues.load(), runs.load()]).catch(() => undefined)
-  selectedCueIds.value = cues.locked.map((item) => item.id)
+  selectedCueIds.value = cues.rehearsable.map((item) => item.id)
 })
 </script>
 
@@ -67,12 +68,13 @@ onMounted(async () => {
   </PageHeader>
   <el-alert v-if="runs.error || cues.error || localError" :title="localError || runs.error || cues.error" type="error" :closable="false" show-icon />
   <section class="run-launcher">
-    <div><p class="eyebrow">LOCKED INPUT SET</p><h2>Select cue versions</h2><p>{{ cues.locked.length }} locked cues available. Dependencies must be included and sequence numbers must be unique.</p></div>
+    <div><p class="eyebrow">LOCKED INPUT SET</p><h2>Select cue versions</h2><p>{{ cues.rehearsable.length }} of {{ cues.locked.length }} locked cues reheasable. Dependencies must be included and sequence numbers must be unique.</p></div>
     <el-select v-model="selectedCueIds" multiple collapse-tags collapse-tags-tooltip placeholder="Choose locked cues">
-      <el-option v-for="cue in cues.locked" :key="cue.id" :value="cue.id" :label="`${cue.cue_code} · v${cue.version} · ${cue.name}`" />
+      <el-option v-for="cue in cues.locked" :key="cue.id" :value="cue.id" :disabled="isDeviceStale(cue)" :label="isDeviceStale(cue) ? `${cue.cue_code} · v${cue.version} · device drift — re-approve required` : `${cue.cue_code} · v${cue.version} · ${cue.name}`" />
     </el-select>
     <el-button v-if="canProgram" type="primary" :icon="Play" :loading="runs.running" :disabled="selectedCueIds.length === 0" @click="run">Run offline rehearsal</el-button>
   </section>
+  <el-alert v-if="cues.stale.length" type="warning" :closable="false" show-icon :title="`${cues.stale.length} cue(s) reference devices whose limits changed after approval; re-approve them on the cue desk before rehearsing.`" />
   <div class="run-selector">
     <button v-for="item in runs.items" :key="item.id" :class="{ selected: runs.selectedId === item.id }" @click="runs.selectedId = item.id">
       <span>#{{ item.id }}</span><strong>{{ item.cue_set_version }}</strong><el-tag :type="statusType(item.run_status)" effect="plain">{{ item.run_status.replaceAll('_',' ') }}</el-tag><small>{{ formatTimestamp(item.finished_at) }}</small>

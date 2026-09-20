@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"stage-rigging-cue-interlock/backend/internal/model"
 	"stage-rigging-cue-interlock/backend/internal/util"
 
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -121,4 +123,98 @@ func (r *CueDefinitionRepository) Transition(id uint, expectedVersion uint, from
 		return nil
 	})
 	return updated, err
+}
+
+// ApproveWithDevicePins moves a pending cue to approved and atomically pins
+// the current revisions of every device its actions reference. The device
+// rows are locked inside the same transaction and re-verified against the
+// pins the reviewer saw: if a device update committed in between, the
+// approval fails with CUE_DEVICE_VERSION_DRIFT and nothing is written.
+func (r *CueDefinitionRepository) ApproveWithDevicePins(id uint, expectedVersion uint, pins []model.DevicePin, reviewerID uint, note string, event audit.Event) (model.CueDefinition, error) {
+	return r.writePins(id, expectedVersion, pins, reviewerID, note, event, map[string]any{"cue_status": constants.CueApproved}, []constants.CueStatus{constants.CuePendingReview})
+}
+
+// RefreshDevicePins re-approves an approved or locked cue whose pinned
+// device revisions went stale. The cue content and status stay untouched;
+// only the pins, review metadata, and optimistic version move forward.
+func (r *CueDefinitionRepository) RefreshDevicePins(id uint, expectedVersion uint, pins []model.DevicePin, reviewerID uint, note string, event audit.Event) (model.CueDefinition, error) {
+	return r.writePins(id, expectedVersion, pins, reviewerID, note, event, map[string]any{}, []constants.CueStatus{constants.CueApproved, constants.CueLocked})
+}
+
+func (r *CueDefinitionRepository) writePins(id uint, expectedVersion uint, pins []model.DevicePin, reviewerID uint, note string, event audit.Event, extra map[string]any, allowedFrom []constants.CueStatus) (model.CueDefinition, error) {
+	var updated model.CueDefinition
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		if err := r.verifyPinsCurrent(tx, pins); err != nil {
+			return err
+		}
+		pinsJSON, err := json.Marshal(pins)
+		if err != nil {
+			return fmt.Errorf("encode device pins: %w", err)
+		}
+		updates := map[string]any{"device_pins_json": datatypes.JSON(pinsJSON), "version": expectedVersion + 1, "approved_by": reviewerID, "review_note": note}
+		for key, value := range extra {
+			updates[key] = value
+		}
+		result := tx.Model(&model.CueDefinition{}).Where("id = ? AND version = ? AND cue_status IN ?", id, expectedVersion, allowedFrom).Updates(updates)
+		if result.Error != nil {
+			return fmt.Errorf("write cue device pins: %w", result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return util.Conflict("CUE_VERSION_CONFLICT", "cue state or version changed concurrently", nil)
+		}
+		if err := r.audit.WithTx(tx).Record(event); err != nil {
+			return err
+		}
+		if err := tx.First(&updated, id).Error; err != nil {
+			return fmt.Errorf("reload pinned cue: %w", err)
+		}
+		return nil
+	})
+	return updated, err
+}
+
+// verifyPinsCurrent locks the referenced device rows and confirms each pin
+// still matches the committed device revision. A mismatch means a device
+// update won the race and the approval must be retried with fresh pins.
+func (r *CueDefinitionRepository) verifyPinsCurrent(tx *gorm.DB, pins []model.DevicePin) error {
+	ids := make([]uint, 0, len(pins))
+	for _, pin := range pins {
+		ids = append(ids, pin.DeviceID)
+	}
+	if err := lockRiggingDevices(tx, r.db.Dialector.Name(), ids); err != nil {
+		if isLockBusy(err) {
+			return util.Conflict("CUE_DEVICE_LOCK_BUSY", "device limits are being updated concurrently; retry the approval", err)
+		}
+		return err
+	}
+	devices := []model.RiggingDevice{}
+	if len(ids) > 0 {
+		if err := tx.Where("id IN ?", ids).Find(&devices).Error; err != nil {
+			return fmt.Errorf("read locked device revisions: %w", err)
+		}
+	}
+	current := make(map[uint]uint, len(devices))
+	for _, device := range devices {
+		current[device.ID] = device.Version
+	}
+	for _, pin := range pins {
+		version, ok := current[pin.DeviceID]
+		if !ok {
+			return util.Unprocessable("DEVICE_REFERENCE_INVALID", "a pinned device no longer exists", map[string]any{"device_id": pin.DeviceID, "device_code": pin.DeviceCode})
+		}
+		if version != pin.PinnedVersion {
+			return util.ConflictDetails("CUE_DEVICE_VERSION_DRIFT", "device limits changed while the approval was in progress; reload and retry", map[string]any{"device_id": pin.DeviceID, "device_code": pin.DeviceCode, "expected_version": pin.PinnedVersion, "current_version": version})
+		}
+	}
+	return nil
+}
+
+// ApprovedWithPins lists approved or locked cues so callers can find which
+// cues a device revision change invalidates.
+func (r *CueDefinitionRepository) ApprovedWithPins() ([]model.CueDefinition, error) {
+	var items []model.CueDefinition
+	if err := r.db.Where("cue_status IN ?", []string{string(constants.CueApproved), string(constants.CueLocked)}).Order("cue_code ASC").Find(&items).Error; err != nil {
+		return nil, fmt.Errorf("list approved cues with pins: %w", err)
+	}
+	return items, nil
 }
