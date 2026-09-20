@@ -16,12 +16,13 @@ import (
 )
 
 type CueDefinitionService struct {
-	cues    *repository.CueDefinitionRepository
-	devices *repository.RiggingDeviceRepository
+	cues     *repository.CueDefinitionRepository
+	devices  *repository.RiggingDeviceRepository
+	enricher *DeviceLockEnricher
 }
 
-func NewCueDefinitionService(cues *repository.CueDefinitionRepository, devices *repository.RiggingDeviceRepository) *CueDefinitionService {
-	return &CueDefinitionService{cues: cues, devices: devices}
+func NewCueDefinitionService(cues *repository.CueDefinitionRepository, devices *repository.RiggingDeviceRepository, enricher *DeviceLockEnricher) *CueDefinitionService {
+	return &CueDefinitionService{cues: cues, devices: devices, enricher: enricher}
 }
 
 func (s *CueDefinitionService) List(page, pageSize int, status, search string) ([]dto.CueDefinitionResponse, int64, error) {
@@ -31,7 +32,7 @@ func (s *CueDefinitionService) List(page, pageSize int, status, search string) (
 	}
 	responses := make([]dto.CueDefinitionResponse, 0, len(items))
 	for _, item := range items {
-		response, mapErr := dto.CueFromModel(item)
+		response, mapErr := s.toResponse(item)
 		if mapErr != nil {
 			return nil, 0, mapErr
 		}
@@ -45,7 +46,18 @@ func (s *CueDefinitionService) Get(id uint) (dto.CueDefinitionResponse, error) {
 	if err != nil {
 		return dto.CueDefinitionResponse{}, err
 	}
-	return dto.CueFromModel(item)
+	return s.toResponse(item)
+}
+
+func (s *CueDefinitionService) toResponse(item model.CueDefinition) (dto.CueDefinitionResponse, error) {
+	response, err := dto.CueFromModel(item)
+	if err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	if err := s.enricher.Apply(&response, item); err != nil {
+		return dto.CueDefinitionResponse{}, err
+	}
+	return response, nil
 }
 
 func (s *CueDefinitionService) Create(request dto.CreateCueRequest, actor audit.ActorContext) (dto.CueDefinitionResponse, error) {
@@ -61,7 +73,7 @@ func (s *CueDefinitionService) Create(request dto.CreateCueRequest, actor audit.
 	if err := s.cues.Create(&item, audit.NewEvent(actor, "cue_definition.create", "cue_definition", 0, "{}", after)); err != nil {
 		return dto.CueDefinitionResponse{}, err
 	}
-	return dto.CueFromModel(item)
+	return s.toResponse(item)
 }
 
 func (s *CueDefinitionService) Update(id uint, request dto.UpdateCueRequest, actor audit.ActorContext) (dto.CueDefinitionResponse, error) {
@@ -93,9 +105,12 @@ func (s *CueDefinitionService) Update(id uint, request dto.UpdateCueRequest, act
 	if err := s.cues.Update(&current, request.Version, audit.NewEvent(actor, "cue_definition.update", "cue_definition", id, util.SummaryJSON(beforeResponse), after)); err != nil {
 		return dto.CueDefinitionResponse{}, err
 	}
-	return dto.CueFromModel(current)
+	return s.toResponse(current)
 }
 
+// Transition dispatches the reviewer/programmer action to the dedicated
+// transactional repository path. Every path carries the device-version-lock
+// semantics: submit snapshots, approve freezes, reject clears, lock verifies.
 func (s *CueDefinitionService) Transition(id uint, request dto.CueTransitionRequest, target constants.CueStatus, actor audit.ActorContext) (dto.CueDefinitionResponse, error) {
 	current, err := s.cues.Get(id)
 	if err != nil {
@@ -105,17 +120,34 @@ func (s *CueDefinitionService) Transition(id uint, request dto.CueTransitionRequ
 	if !constants.CanTransitionCue(from, target) {
 		return dto.CueDefinitionResponse{}, util.Unprocessable("INVALID_CUE_TRANSITION", fmt.Sprintf("cannot transition cue from %s to %s", from, target), map[string]any{"from": from, "to": target})
 	}
+	note := strings.TrimSpace(request.Reason)
 	var reviewerID *uint
 	if target == constants.CueApproved {
 		reviewerID = &actor.ID
 	}
 	before := util.SummaryJSON(map[string]any{"cue_status": from, "version": current.Version, "approved_by": current.ApprovedBy})
-	after := util.SummaryJSON(map[string]any{"cue_status": target, "version": request.Version + 1, "review_reason": request.Reason, "reviewer_id": reviewerID})
-	updated, err := s.cues.Transition(id, request.Version, from, target, reviewerID, strings.TrimSpace(request.Reason), audit.NewEvent(actor, "cue_definition.transition", "cue_definition", id, before, after))
+	after := util.SummaryJSON(map[string]any{"cue_status": target, "version": request.Version + 1, "review_reason": note, "reviewer_id": reviewerID})
+	event := audit.NewEvent(actor, "cue_definition.transition."+string(target), "cue_definition", id, before, after)
+
+	var updated model.CueDefinition
+	switch target {
+	case constants.CuePendingReview:
+		updated, err = s.cues.SubmitForReview(id, request.Version, note, event)
+	case constants.CueApproved:
+		updated, err = s.cues.Approve(id, request.Version, actor.ID, note, event)
+	case constants.CueDraft:
+		updated, err = s.cues.ReturnToDraft(id, request.Version, from, note, event)
+	case constants.CueLocked:
+		updated, err = s.cues.LockVersion(id, request.Version, note, event)
+	case constants.CueArchived:
+		updated, err = s.cues.Archive(id, request.Version, note, event)
+	default:
+		return dto.CueDefinitionResponse{}, util.Unprocessable("INVALID_CUE_TRANSITION", fmt.Sprintf("unsupported cue target status %s", target), nil)
+	}
 	if err != nil {
 		return dto.CueDefinitionResponse{}, err
 	}
-	return dto.CueFromModel(updated)
+	return s.toResponse(updated)
 }
 
 func (s *CueDefinitionService) validateCueInput(selfID uint, duration int64, actions []dto.CueAction, dependencyIDs []uint) error {

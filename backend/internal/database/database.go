@@ -63,6 +63,7 @@ func migrate(db *gorm.DB) error {
 		&auth.User{},
 		&model.RiggingDevice{},
 		&model.CueDefinition{},
+		&model.CueDeviceVersion{},
 		&model.InterlockRule{},
 		&model.RehearsalRun{},
 		&audit.Event{},
@@ -165,6 +166,13 @@ func seedCues(tx *gorm.DB, users map[string]auth.User, devices map[string]model.
 		cue := model.CueDefinition{CueCode: definition.code, Name: definition.name, SequenceNo: definition.sequence, StartOffsetMS: definition.start, DurationMS: definition.duration, CueStatus: string(constants.CueLocked), Version: 4, CreatedBy: programmer.ID, ApprovedBy: &reviewer.ID, ActionsJSON: datatypes.JSON(actionsJSON), DependenciesJSON: datatypes.JSON(dependenciesJSON), ReviewNote: "Seeded locked rehearsal reference; offline planning only."}
 		if err := tx.Where("cue_code = ?", cue.CueCode).FirstOrCreate(&cue).Error; err != nil {
 			return fmt.Errorf("seed cue %s: %w", cue.CueCode, err)
+		}
+		// Seeded references arrive already locked; backfill their approval device
+		// version pins at the current seeded device version so rehearsal runs
+		// stay derivable with an explicit, explainable version lock.
+		pin := model.CueDeviceVersion{CueID: cue.ID, DeviceID: definition.action.DeviceID, ReviewVersion: 1, PinnedVersion: 1, ActionOrder: 0, ApprovalLocked: true}
+		if err := tx.Where("cue_id = ? AND device_id = ?", cue.ID, pin.DeviceID).FirstOrCreate(&pin).Error; err != nil {
+			return fmt.Errorf("seed cue device pin %s: %w", cue.CueCode, err)
 		}
 		created[cue.CueCode] = cue
 	}

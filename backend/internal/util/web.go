@@ -47,6 +47,12 @@ func Conflict(code, message string, cause error) *AppError {
 	return &AppError{Status: http.StatusConflict, Code: code, Message: message, Cause: cause}
 }
 
+// ConflictDetails carries structured details (e.g. stale device versions)
+// instead of an underlying error cause.
+func ConflictDetails(code, message string, details any) *AppError {
+	return &AppError{Status: http.StatusConflict, Code: code, Message: message, Details: details}
+}
+
 func Unprocessable(code, message string, details any) *AppError {
 	return &AppError{Status: http.StatusUnprocessableEntity, Code: code, Message: message, Details: details}
 }

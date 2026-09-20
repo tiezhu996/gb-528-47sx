@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"stage-rigging-cue-interlock/backend/internal/audit"
+	"stage-rigging-cue-interlock/backend/internal/concurrency"
 	"stage-rigging-cue-interlock/backend/internal/model"
 	"stage-rigging-cue-interlock/backend/internal/util"
 
@@ -13,12 +14,13 @@ import (
 )
 
 type RiggingDeviceRepository struct {
-	db    *gorm.DB
-	audit *audit.Repository
+	db     *gorm.DB
+	audit  *audit.Repository
+	locker *concurrency.KeyedLocker
 }
 
-func NewRiggingDeviceRepository(db *gorm.DB, auditRepository *audit.Repository) *RiggingDeviceRepository {
-	return &RiggingDeviceRepository{db: db, audit: auditRepository}
+func NewRiggingDeviceRepository(db *gorm.DB, auditRepository *audit.Repository, locker *concurrency.KeyedLocker) *RiggingDeviceRepository {
+	return &RiggingDeviceRepository{db: db, audit: auditRepository, locker: locker}
 }
 
 func (r *RiggingDeviceRepository) List(page, pageSize int, status, search string) ([]model.RiggingDevice, int64, error) {
@@ -90,8 +92,37 @@ func (r *RiggingDeviceRepository) Create(item *model.RiggingDevice, event audit.
 	})
 }
 
+// Update changes device parameters under the same per-device lock that guards
+// Cue approval. When a Cue approval touching this device is already in flight
+// the TryLock fails and the service rejects the update with a 409 so that only
+// one of the two operations can commit. The optimistic version predicate makes
+// a lost update between reading the form and saving impossible, and the row
+// lock inside the transaction closes the cross-process window.
 func (r *RiggingDeviceRepository) Update(item *model.RiggingDevice, expectedVersion uint, event audit.Event) error {
+	key := uint64(item.ID)
+	if !r.locker.TryLock(key) {
+		return util.ConflictDetails("DEVICE_UPDATE_REVIEW_CONFLICT", "device parameters cannot change while a cue referencing the device is being approved", map[string]any{"device_id": item.ID})
+	}
+	defer r.locker.Unlock(key)
 	return r.db.Transaction(func(tx *gorm.DB) error {
+		var locked model.RiggingDevice
+		lockQuery := tx.Model(&model.RiggingDevice{}).Where("id = ? AND version = ?", item.ID, expectedVersion)
+		if tx.Dialector.Name() != "sqlite" {
+			lockQuery = lockQuery.Clauses(forUpdateClause())
+		}
+		if err := lockQuery.Find(&locked).Error; err != nil {
+			return fmt.Errorf("lock rigging device for update: %w", err)
+		}
+		if locked.ID == 0 {
+			var current model.RiggingDevice
+			if findErr := tx.Select("version").First(&current, item.ID).Error; findErr != nil {
+				if errors.Is(findErr, gorm.ErrRecordNotFound) {
+					return util.NotFound("DEVICE_NOT_FOUND", "rigging device was not found")
+				}
+				return fmt.Errorf("re-read rigging device version: %w", findErr)
+			}
+			return util.ConflictDetails("DEVICE_VERSION_CONFLICT", "device limits changed since they were loaded", map[string]any{"expected_version": expectedVersion, "current_version": current.Version})
+		}
 		updates := map[string]any{"name": item.Name, "device_type": item.DeviceType, "max_load_kg": item.MaxLoadKG, "max_speed_ms": item.MaxSpeedMS, "travel_min_m": item.TravelMinM, "travel_max_m": item.TravelMaxM, "safety_zone": item.SafetyZone, "device_status": item.DeviceStatus, "version": expectedVersion + 1}
 		result := tx.Model(&model.RiggingDevice{}).Where("id = ? AND version = ?", item.ID, expectedVersion).Updates(updates)
 		if result.Error != nil {
@@ -114,4 +145,13 @@ func uniqueIDs(ids []uint) map[uint]struct{} {
 		result[id] = struct{}{}
 	}
 	return result
+}
+
+// RecordAudit appends an audit event outside the device update transaction
+// (after its commit) for invalidated Cue version locks.
+func (r *RiggingDeviceRepository) RecordAudit(event audit.Event) error {
+	if err := r.audit.Record(event); err != nil {
+		return err
+	}
+	return nil
 }

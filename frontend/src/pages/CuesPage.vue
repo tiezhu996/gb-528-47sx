@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { ArrowRight, CheckCircle2, LockKeyhole, Pencil, Plus, RotateCcw, Save, Trash2, Undo2 } from 'lucide-vue-next'
+import { AlertTriangle, ArrowRight, CheckCircle2, LockKeyhole, Pencil, Plus, RotateCcw, Save, Trash2, Undo2 } from 'lucide-vue-next'
 import { ElMessage } from 'element-plus'
 import PageHeader from '../components/common/PageHeader.vue'
 import CueStatusBadge from '../components/common/CueStatusBadge.vue'
 import TimelineTrack from '../components/common/TimelineTrack.vue'
-import { errorMessage } from '../api/client'
+import DeviceLockPanel from '../components/common/DeviceLockPanel.vue'
+import { errorMessage, ApiError } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { useCueStore } from '../stores/cues'
 import { useDeviceStore } from '../stores/devices'
-import type { CueAction, CueDefinition } from '../types/cue'
+import type { CueAction, CueDefinition, DeviceVersionLock } from '../types/cue'
 import type { TimelineEvent } from '../types/rehearsal'
 
 const cues = useCueStore()
@@ -22,6 +23,31 @@ const reason = ref('Reviewed against the offline rehearsal assumptions and evide
 const selected = computed(() => cues.items.find((item) => item.id === selectedId.value) ?? null)
 const form = reactive({ cue_code: '', name: '', sequence_no: 40, start_offset_ms: 36000, duration_ms: 8000, actions: [] as CueAction[], dependency_ids: [] as number[] })
 
+interface StaleDeviceInfo {
+  device_id: number
+  device_code: string
+  device_name: string
+  locked_version: number
+  current_version: number
+  reason: string
+}
+
+// Stale failure returned by approve/lock so the reviewer can see exactly which
+// devices invalidated the version lock and which old/new versions are involved.
+const staleFailure = ref<StaleDeviceInfo[]>([])
+
+const staleSelectedLocks = computed<DeviceVersionLock[]>(() => (selected.value?.device_locks ?? []).filter((lock) => lock.stale))
+const lockBlocked = computed(() => Boolean(selected.value && selected.value.cue_status === 'approved' && selected.value.device_lock_stale))
+const approveBlocked = computed(() => Boolean(selected.value && selected.value.cue_status === 'pending_review' && selected.value.device_lock_stale))
+
+function extractStaleDevices(error: unknown): StaleDeviceInfo[] {
+  if (!(error instanceof ApiError) || error.code !== 'CUE_DEVICE_VERSION_STALE') return []
+  const details = error.details as { stale_devices?: StaleDeviceInfo[]; stale_cues?: Array<{ stale_devices?: StaleDeviceInfo[] }> } | null
+  if (details?.stale_devices?.length) return details.stale_devices
+  const fromCues = details?.stale_cues?.flatMap((cue) => cue.stale_devices ?? []) ?? []
+  return fromCues
+}
+
 const previewEvents = computed<TimelineEvent[]>(() => cues.items.flatMap((cue) => cue.actions.map((action) => {
   const device = devices.items.find((item) => item.id === action.device_id)
   return { cue_id: cue.id, cue_code: cue.cue_code, cue_sequence: cue.sequence_no, cue_version: cue.version, device_id: action.device_id, device_code: device?.device_code ?? `DEVICE-${action.device_id}`, device_name: device?.name ?? 'Unknown device', safety_zone: device?.safety_zone ?? '', start_ms: cue.start_offset_ms + action.start_offset_ms, end_ms: cue.start_offset_ms + action.start_offset_ms + action.duration_ms, from_position_m: action.from_position_m, to_position_m: action.to_position_m, load_kg: action.load_kg, speed_ms: Math.abs(action.to_position_m - action.from_position_m) / (action.duration_ms / 1000) }
@@ -33,12 +59,14 @@ function blankAction(): CueAction {
 
 function reset() {
   selectedId.value = null
+  staleFailure.value = []
   Object.assign(form, { cue_code: '', name: '', sequence_no: Math.max(10, ...cues.items.map((item) => item.sequence_no + 10)), start_offset_ms: Math.max(0, ...cues.items.map((item) => item.start_offset_ms + item.duration_ms + 1000)), duration_ms: 8000, actions: [blankAction()], dependency_ids: [] })
   localError.value = ''
 }
 
 function edit(cue: CueDefinition) {
   selectedId.value = cue.id
+  staleFailure.value = []
   Object.assign(form, { cue_code: cue.cue_code, name: cue.name, sequence_no: cue.sequence_no, start_offset_ms: cue.start_offset_ms, duration_ms: cue.duration_ms, actions: cue.actions.map((item) => ({ ...item })), dependency_ids: [...(cue.dependency_ids ?? [])] })
 }
 
@@ -73,11 +101,18 @@ async function save() {
 async function transition(action: 'submit' | 'approve' | 'reject' | 'lock' | 'archive') {
   if (!selected.value) return
   localError.value = ''
+  staleFailure.value = []
   try {
     const updated = await cues.transition(selected.value.id, action, selected.value.version, reason.value)
     edit(updated)
     ElMessage.success(`Cue moved to ${updated.cue_status.replaceAll('_', ' ')}`)
   } catch (cause) {
+    staleFailure.value = extractStaleDevices(cause)
+    if (staleFailure.value.length > 0) {
+      await cues.load().catch(() => undefined)
+      const current = cues.items.find((item) => item.id === selected.value?.id)
+      if (current) edit(current)
+    }
     localError.value = errorMessage(cause)
   }
 }
@@ -105,13 +140,42 @@ onMounted(async () => {
         <el-table-column label="Start / duration" width="145"><template #default="scope">{{ (scope.row.start_offset_ms / 1000).toFixed(1) }}s<div class="subtle">{{ (scope.row.duration_ms / 1000).toFixed(1) }}s duration</div></template></el-table-column>
         <el-table-column label="Actions" width="82"><template #default="scope">{{ scope.row.actions.length }}</template></el-table-column>
         <el-table-column label="Depends" min-width="120"><template #default="scope">{{ dependencyLabels(scope.row.dependency_ids) }}</template></el-table-column>
-        <el-table-column label="Status" width="145"><template #default="scope"><CueStatusBadge :status="scope.row.cue_status" /></template></el-table-column>
+        <el-table-column label="Status" width="145"><template #default="scope"><CueStatusBadge :status="scope.row.cue_status" /><el-tag v-if="scope.row.device_lock_stale" class="stale-row-tag" type="danger" size="small" effect="plain"><AlertTriangle :size="11" /> Device lock stale</el-tag></template></el-table-column>
         <el-table-column width="56"><template #default="scope"><el-button circle text :icon="Pencil" title="Inspect cue" @click.stop="edit(scope.row)" /></template></el-table-column>
       </el-table>
     </section>
     <aside class="editor-panel cue-editor">
       <div class="section-heading"><div><p class="eyebrow">{{ selected ? `CUE VERSION ${selected.version}` : 'NEW DRAFT' }}</p><h2>{{ selected ? selected.cue_code : 'Cue definition' }}</h2></div><el-button v-if="selected" circle text :icon="RotateCcw" title="Clear selection" @click="reset" /></div>
       <CueStatusBadge v-if="selected" :status="selected.cue_status" />
+      <el-alert
+        v-if="selected && selected.device_lock_stale"
+        class="stale-banner"
+        type="error"
+        :closable="false"
+        show-icon
+        :title="`Device version lock invalidated for ${staleSelectedLocks.length} device(s)`"
+        :description="selected.device_lock_reason"
+      >
+        <template #icon><AlertTriangle /></template>
+      </el-alert>
+      <DeviceLockPanel v-if="selected && selected.device_locks.length > 0" :cue="selected" />
+      <div v-if="staleFailure.length > 0" class="stale-failure-detail data-section">
+        <p class="eyebrow">BLOCKED BY CHANGED DEVICE PARAMETERS</p>
+        <el-table :data="staleFailure" size="small">
+          <el-table-column label="Affected device" min-width="150">
+            <template #default="scope"><strong>{{ scope.row.device_code || `DEVICE-${scope.row.device_id}` }}</strong><div class="subtle">{{ scope.row.device_name }}</div></template>
+          </el-table-column>
+          <el-table-column label="Old version" width="92">
+            <template #default="scope">v{{ scope.row.locked_version }}</template>
+          </el-table-column>
+          <el-table-column label="New version" width="92">
+            <template #default="scope"><span class="version-mismatch">v{{ scope.row.current_version }}</span></template>
+          </el-table-column>
+          <el-table-column label="Reason" min-width="180">
+            <template #default="scope">{{ scope.row.reason }}</template>
+          </el-table-column>
+        </el-table>
+      </div>
       <el-form v-if="canProgram && (!selected || selected.cue_status === 'draft')" label-position="top">
         <div class="form-grid two"><el-form-item label="Cue code"><el-input v-model="form.cue_code" :disabled="Boolean(selected)" placeholder="Q-040" /></el-form-item><el-form-item label="Name"><el-input v-model="form.name" /></el-form-item></div>
         <div class="form-grid three"><el-form-item label="Sequence"><el-input-number v-model="form.sequence_no" :min="1" /></el-form-item><el-form-item label="Start (ms)"><el-input-number v-model="form.start_offset_ms" :min="0" :step="100" /></el-form-item><el-form-item label="Duration (ms)"><el-input-number v-model="form.duration_ms" :min="100" :step="100" /></el-form-item></div>
@@ -128,9 +192,15 @@ onMounted(async () => {
         <el-input v-model="reason" type="textarea" :rows="2" maxlength="500" show-word-limit />
         <div class="transition-actions">
           <el-button v-if="canProgram && selected.cue_status === 'draft'" type="primary" :icon="CheckCircle2" @click="transition('submit')">Submit review</el-button>
-          <el-button v-if="canReview && selected.cue_status === 'pending_review'" type="success" :icon="CheckCircle2" @click="transition('approve')">Approve cue</el-button>
+          <el-tooltip v-if="canReview && selected.cue_status === 'pending_review' && approveBlocked" placement="top" content="A referenced device changed during review. Return the cue to draft, resubmit the same content and approve again.">
+            <el-button type="success" :icon="CheckCircle2" disabled>Approve cue</el-button>
+          </el-tooltip>
+          <el-button v-else-if="canReview && selected.cue_status === 'pending_review'" type="success" :icon="CheckCircle2" @click="transition('approve')">Approve cue</el-button>
           <el-button v-if="canReview && selected.cue_status === 'pending_review'" :icon="Undo2" @click="transition('reject')">Return to draft</el-button>
-          <el-button v-if="canReview && selected.cue_status === 'approved'" type="primary" :icon="LockKeyhole" @click="transition('lock')">Lock version</el-button>
+          <el-tooltip v-if="canReview && selected.cue_status === 'approved' && lockBlocked" placement="top" content="The approval pin no longer matches a live device version. Return to draft, resubmit the same content and approve again to relock.">
+            <el-button type="primary" :icon="LockKeyhole" disabled>Lock version</el-button>
+          </el-tooltip>
+          <el-button v-else-if="canReview && selected.cue_status === 'approved'" type="primary" :icon="LockKeyhole" @click="transition('lock')">Lock version</el-button>
           <el-button v-if="canReview && selected.cue_status === 'locked'" :icon="LockKeyhole" @click="transition('archive')">Archive</el-button>
         </div>
         <p class="boundary-copy">Approval and lock apply only to this offline cue version. They do not release or command machinery.</p>
@@ -138,3 +208,20 @@ onMounted(async () => {
     </aside>
   </div>
 </template>
+
+<style scoped>
+.stale-banner {
+  margin: 10px 0;
+}
+.stale-row-tag {
+  margin-top: 4px;
+}
+.stale-failure-detail {
+  margin-top: 10px;
+  border-color: var(--el-color-danger-light-5);
+}
+.version-mismatch {
+  color: var(--el-color-danger);
+  font-weight: 700;
+}
+</style>

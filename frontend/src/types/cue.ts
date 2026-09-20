@@ -9,6 +9,18 @@ export interface CueAction {
   load_kg: number
 }
 
+export interface DeviceVersionLock {
+  device_id: number
+  device_code: string
+  device_name: string
+  safety_zone: string
+  review_version: number
+  pinned_version: number
+  current_version: number
+  stale: boolean
+  stale_reason: string
+}
+
 export interface CueDefinition {
   id: number
   cue_code: string
@@ -23,6 +35,10 @@ export interface CueDefinition {
   actions: CueAction[]
   dependency_ids: number[]
   review_note: string
+  device_locks: DeviceVersionLock[]
+  device_lock_stale: boolean
+  device_lock_reason: string
+  device_lock_missing: boolean
   created_at: string
   updated_at: string
 }

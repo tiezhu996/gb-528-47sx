@@ -13,6 +13,7 @@ import (
 
 	"stage-rigging-cue-interlock/backend/internal/audit"
 	"stage-rigging-cue-interlock/backend/internal/auth"
+	"stage-rigging-cue-interlock/backend/internal/concurrency"
 	"stage-rigging-cue-interlock/backend/internal/config"
 	"stage-rigging-cue-interlock/backend/internal/database"
 	"stage-rigging-cue-interlock/backend/internal/handler"
@@ -47,16 +48,20 @@ func main() {
 
 	auditRepository := audit.NewRepository(db)
 	authRepository := auth.NewRepository(db)
-	deviceRepository := repository.NewRiggingDeviceRepository(db, auditRepository)
-	cueRepository := repository.NewCueDefinitionRepository(db, auditRepository)
+	deviceLocker := concurrency.NewKeyedLocker()
+	pinRepository := repository.NewCueDeviceVersionRepository(db, deviceLocker)
+	deviceRepository := repository.NewRiggingDeviceRepository(db, auditRepository, deviceLocker)
+	cueRepository := repository.NewCueDefinitionRepository(db, auditRepository, pinRepository)
 	ruleRepository := repository.NewInterlockRuleRepository(db, auditRepository)
 	runRepository := repository.NewRehearsalRunRepository(db, auditRepository)
 
 	authService := auth.NewService(authRepository, cfg.JWTSecret, cfg.JWTTTL)
-	deviceService := service.NewRiggingDeviceService(deviceRepository, ruleRepository)
-	cueService := service.NewCueDefinitionService(cueRepository, deviceRepository)
+	deviceLockEnricher := service.NewDeviceLockEnricher(pinRepository, deviceRepository)
+	deviceService := service.NewRiggingDeviceService(deviceRepository, ruleRepository, pinRepository, cueRepository)
+	cueService := service.NewCueDefinitionService(cueRepository, deviceRepository, deviceLockEnricher)
 	ruleService := service.NewInterlockRuleService(ruleRepository, deviceRepository)
-	runService := service.NewRehearsalRunService(runRepository, cueRepository, deviceRepository, ruleRepository, cfg.TimelineStepMS, cfg.MaxCuesPerRun)
+	runLockGuard := service.NewRehearsalDeviceLockGuard(pinRepository)
+	runService := service.NewRehearsalRunService(runRepository, cueRepository, deviceRepository, ruleRepository, runLockGuard, cfg.TimelineStepMS, cfg.MaxCuesPerRun)
 
 	engine := gin.New()
 	engine.Use(middleware.RequestID())

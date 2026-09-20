@@ -38,9 +38,11 @@ docker compose down -v --remove-orphans
 
 - `RiggingDevice`：设备代码、类型、载荷/速度/行程、安全区、状态和乐观锁版本；设备页同时展示适用规则。
 - `CueDefinition`：序号、绝对起始时间、时长、动作 JSON、依赖 JSON、创建人、批准人和完整状态流。
+- `CueDeviceVersion`：Cue 设备版本锁。提交复核时快照动作引用设备的当前版本（review pin），批准时冻结为审批版本锁（approval pin）；设备参数变更后历史批准与推演结果保留，但该 Cue 不能再锁定或重新推演，重新走"退回草稿 → 提交 → 批准"恢复。
 - `InterlockRule`：负载、速度、行程、安全区互斥和依赖间隔五类规则，保存设备范围、结构化阈值、严重度、启停与规则版本。
 - `RehearsalRun`：不可覆盖的 Cue/规则版本快照、动作时间线、规则结果、碰撞窗口、最高严重度与人工复核记录。
 - 五个业务页：设备模型、Cue 编排、联锁规则、离线推演、审计复核；共享时间线和证据表只消费真实 API。
+- Cue 页设备版本锁面板：展示每台引用设备的复核版本、批准版本与当前版本；失效时红色横幅说明原因、列出影响设备及旧/新版本，并禁用失效状态下的批准/锁定按钮；推演页隐藏失效锁定 Cue 并在被拒时展示影响范围。
 - JWT/RBAC、request ID、结构化访问日志、panic recovery、本地限流、统一错误响应、事务状态迁移和追加式审计。
 
 项目不包含票务、场地预约、工单、库存、订单或财务功能。
@@ -73,6 +75,15 @@ draft -> pending_review -> approved -> locked -> archived
 
 批准、退回和锁定只能由 `safety_reviewer` 或 `admin` 执行。只有 `locked` Cue 版本可进入推演。
 
+### Cue 设备版本锁
+
+- **提交复核（draft → pending_review）**：在同一事务中对 Cue 动作引用的每台设备读取当前 `version`，写入 review pin（`cue_device_versions.review_version`）。
+- **批准（pending_review → approved）**：事务内对引用设备行加 `FOR UPDATE` 锁并重读；任一设备版本与 review pin 不符则整笔回滚并返回 `CUE_DEVICE_VERSION_STALE`（`details.stale_devices` 列出设备及旧/新版本），通过后冻结为 approval pin（`pinned_version`）。
+- **锁定（approved → locked）**：逐台核对 approval pin 与设备当前版本；设备参数在批准后变化则拒绝，返回失效设备、旧版本和新版本。
+- **推演**：历史 `RehearsalRun` 不可覆盖、始终可读；对锁定 Cue 发起新推演前统一核对版本锁，任一 Cue 失效即返回 `CUE_DEVICE_VERSION_STALE`，`details.stale_cues` 给出全部受影响 Cue 与设备。
+- **恢复**：复核员将失效 Cue 退回草稿（清空旧 pin），程序员以相同内容重新提交，复核员重新批准后版本锁刷新，可再次锁定与推演。
+- **并发**：设备参数更新与 Cue 批准共享按设备 ID 排序的进程内键锁，并依赖数据库行锁跨进程互斥；冲突时后到方得到 `DEVICE_UPDATE_REVIEW_CONFLICT`（409），双方均为事务，失败方不产生任何半更新。设备更新提交后追加 `rigging_device.invalidates_cue_lock` 审计事件（含设备旧/新版本与受影响 Cue）。
+
 `InterlockResult = pass | warning | blocker | invalid`
 
 - 数据库：`rehearsal_runs.highest_severity` 显式 `CHECK` 约束，完整结果保存在 `rule_results_json`。
@@ -102,7 +113,7 @@ draft -> pending_review -> approved -> locked -> archived
 | `GET` | `/api/v1/rehearsals/:id/compare?other_id=` | 比较两个运行版本 |
 | `GET` | `/api/v1/audit-events` | 复核员读取追加式审计事件 |
 
-统一响应包含 `data`（列表另含 `meta`）和 `request_id`；错误包含 `error.code`、`error.message`、可选 `error.details` 与 `request_id`。主要错误码包括 `CUE_DEPENDENCY_CYCLE`、`MISSING_CUE_DEPENDENCY`、`DUPLICATE_CUE_SEQUENCE`、`ACTION_OUT_OF_CUE_BOUNDS`、`CUE_NOT_LOCKED`、`BLOCKER_RUN_NOT_APPROVABLE`、各实体版本冲突、`AUTH_REQUIRED` 与 `FORBIDDEN`。
+统一响应包含 `data`（列表另含 `meta`）和 `request_id`；错误包含 `error.code`、`error.message`、可选 `error.details` 与 `request_id`。主要错误码包括 `CUE_DEPENDENCY_CYCLE`、`MISSING_CUE_DEPENDENCY`、`DUPLICATE_CUE_SEQUENCE`、`ACTION_OUT_OF_CUE_BOUNDS`、`CUE_NOT_LOCKED`、`BLOCKER_RUN_NOT_APPROVABLE`、`CUE_DEVICE_VERSION_STALE`、`DEVICE_UPDATE_REVIEW_CONFLICT`、`CUE_DEVICE_LOCK_MISSING`、各实体版本冲突、`AUTH_REQUIRED` 与 `FORBIDDEN`。
 
 ## 技术栈与结构
 
@@ -162,6 +173,8 @@ docker compose config --quiet
 - 返回 `CUE_NOT_LOCKED`：所选 Cue 仍是草稿、待审或仅批准状态，需安全复核员锁定该明确版本。
 - 返回 `BLOCKER_RUN_NOT_SUBMITTABLE`：打开推演证据表，按规则编号、设备和时间窗口修正新 Cue 版本；历史运行不会被覆盖。
 - 返回 409 版本冲突：刷新实体后基于最新 `version` 或 `rule_version` 重试，不要复用旧表单版本。
+- 返回 `CUE_DEVICE_VERSION_STALE`：查看 `error.details.stale_devices`（批准/锁定接口）或 `stale_cues`（推演接口），其中给出失效设备、锁定版本与当前版本；历史批准和推演不受影响，把 Cue 退回草稿、按相同内容重新提交并批准即可恢复。
+- 返回 `DEVICE_UPDATE_REVIEW_CONFLICT`：设备参数更新与 Cue 批准并发，只有一方成功；稍后刷新设备/Cue 版本后重试，失败方没有部分写入。
 
 ## License
 

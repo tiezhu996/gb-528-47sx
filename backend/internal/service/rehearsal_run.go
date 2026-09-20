@@ -26,12 +26,13 @@ type RehearsalRunService struct {
 	cues           *repository.CueDefinitionRepository
 	devices        *repository.RiggingDeviceRepository
 	rules          *repository.InterlockRuleRepository
+	lockGuard      *RehearsalDeviceLockGuard
 	timelineStepMS int64
 	maxCues        int
 }
 
-func NewRehearsalRunService(runs *repository.RehearsalRunRepository, cues *repository.CueDefinitionRepository, devices *repository.RiggingDeviceRepository, rules *repository.InterlockRuleRepository, timelineStepMS int64, maxCues int) *RehearsalRunService {
-	return &RehearsalRunService{runs: runs, cues: cues, devices: devices, rules: rules, timelineStepMS: timelineStepMS, maxCues: maxCues}
+func NewRehearsalRunService(runs *repository.RehearsalRunRepository, cues *repository.CueDefinitionRepository, devices *repository.RiggingDeviceRepository, rules *repository.InterlockRuleRepository, lockGuard *RehearsalDeviceLockGuard, timelineStepMS int64, maxCues int) *RehearsalRunService {
+	return &RehearsalRunService{runs: runs, cues: cues, devices: devices, rules: rules, lockGuard: lockGuard, timelineStepMS: timelineStepMS, maxCues: maxCues}
 }
 
 func (s *RehearsalRunService) List(page, pageSize int, status, severity, search string) ([]dto.RehearsalRunResponse, int64, error) {
@@ -86,6 +87,11 @@ func (s *RehearsalRunService) Run(request dto.RunRehearsalRequest, actor audit.A
 	}
 	deviceModels, err := s.devices.All()
 	if err != nil {
+		return dto.RehearsalRunResponse{}, err
+	}
+	// Refuse new derivation when the locked approval pins lag behind live
+	// device parameters. Historical RehearsalRun rows stay untouched.
+	if err := s.lockGuard.EnsureCurrent(cueModels, deviceModels); err != nil {
 		return dto.RehearsalRunResponse{}, err
 	}
 	deviceInputs := make([]interlock.DeviceInput, 0, len(deviceModels))

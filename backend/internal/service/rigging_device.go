@@ -15,10 +15,12 @@ import (
 type RiggingDeviceService struct {
 	devices *repository.RiggingDeviceRepository
 	rules   *repository.InterlockRuleRepository
+	pins    *repository.CueDeviceVersionRepository
+	cues    *repository.CueDefinitionRepository
 }
 
-func NewRiggingDeviceService(devices *repository.RiggingDeviceRepository, rules *repository.InterlockRuleRepository) *RiggingDeviceService {
-	return &RiggingDeviceService{devices: devices, rules: rules}
+func NewRiggingDeviceService(devices *repository.RiggingDeviceRepository, rules *repository.InterlockRuleRepository, pins *repository.CueDeviceVersionRepository, cues *repository.CueDefinitionRepository) *RiggingDeviceService {
+	return &RiggingDeviceService{devices: devices, rules: rules, pins: pins, cues: cues}
 }
 
 func (s *RiggingDeviceService) List(page, pageSize int, status, search string) ([]dto.RiggingDeviceResponse, int64, error) {
@@ -57,6 +59,10 @@ func (s *RiggingDeviceService) Create(request dto.CreateRiggingDeviceRequest, ac
 	return s.withRules(item)
 }
 
+// Update applies the version-checked parameter change and, after commit,
+// appends an audit entry per approved/locked Cue whose device version lock the
+// update invalidated. The Cues themselves are not modified: historical
+// approvals and rehearsal runs must remain exactly as they were.
 func (s *RiggingDeviceService) Update(id uint, request dto.UpdateRiggingDeviceRequest, actor audit.ActorContext) (dto.RiggingDeviceResponse, error) {
 	if err := validateDeviceEnvelope(request.TravelMinM, request.TravelMaxM); err != nil {
 		return dto.RiggingDeviceResponse{}, err
@@ -65,7 +71,7 @@ func (s *RiggingDeviceService) Update(id uint, request dto.UpdateRiggingDeviceRe
 	if err != nil {
 		return dto.RiggingDeviceResponse{}, err
 	}
-	before := util.SummaryJSON(map[string]any{"limits": map[string]any{"max_load_kg": current.MaxLoadKG, "max_speed_ms": current.MaxSpeedMS, "travel_min_m": current.TravelMinM, "travel_max_m": current.TravelMaxM}, "safety_zone": current.SafetyZone, "status": current.DeviceStatus, "version": current.Version})
+	changed, before, after := s.changeSummary(current, request)
 	current.Name = strings.TrimSpace(request.Name)
 	current.DeviceType = request.DeviceType
 	current.MaxLoadKG = request.MaxLoadKG
@@ -74,11 +80,80 @@ func (s *RiggingDeviceService) Update(id uint, request dto.UpdateRiggingDeviceRe
 	current.TravelMaxM = request.TravelMaxM
 	current.SafetyZone = strings.ToLower(strings.TrimSpace(request.SafetyZone))
 	current.DeviceStatus = request.DeviceStatus
-	after := util.SummaryJSON(map[string]any{"limits": map[string]any{"max_load_kg": current.MaxLoadKG, "max_speed_ms": current.MaxSpeedMS, "travel_min_m": current.TravelMinM, "travel_max_m": current.TravelMaxM}, "safety_zone": current.SafetyZone, "status": current.DeviceStatus, "version": request.Version + 1})
 	if err := s.devices.Update(&current, request.Version, audit.NewEvent(actor, "rigging_device.update_limits", "rigging_device", id, before, after)); err != nil {
 		return dto.RiggingDeviceResponse{}, err
 	}
+	// Parameters only move from version N to N+1 here, so pins with an older
+	// version become stale at this exact commit. The invalidation evidence is
+	// recorded as its own append-only event per affected Cue.
+	if changed {
+		if err := s.recordInvalidatedLocks(id, request.Version+1, actor); err != nil {
+			return dto.RiggingDeviceResponse{}, err
+		}
+	}
 	return s.withRules(current)
+}
+
+// recordInvalidatedLocks enumerates approval-locked pins on the updated device
+// that belonged to approved/locked Cues and writes one audit event per Cue.
+// Pins from pending_review Cues also go stale there, so they are included to
+// give the reviewer the full blast radius; each event carries old/new versions.
+func (s *RiggingDeviceService) recordInvalidatedLocks(deviceID, newVersion uint, actor audit.ActorContext) error {
+	pins, err := s.pins.ActiveByDevice(deviceID)
+	if err != nil {
+		return err
+	}
+	// Include review-phase pins so the reviewer sees the conflict that will
+	// surface as CUE_DEVICE_VERSION_STALE on the approve action.
+	reviewPins, err := s.pins.ReviewPinsByDevice(deviceID)
+	if err != nil {
+		return err
+	}
+	byCue := map[uint]uint{}
+	for _, pin := range append(pins, reviewPins...) {
+		// Prefer the approval-pinned version when both exist for the same Cue.
+		if pin.PinnedVersion > 0 {
+			byCue[pin.CueID] = pin.PinnedVersion
+		} else if _, exists := byCue[pin.CueID]; !exists {
+			byCue[pin.CueID] = pin.ReviewVersion
+		}
+	}
+	if len(byCue) == 0 {
+		return nil
+	}
+	cueIDs := make([]uint, 0, len(byCue))
+	for cueID := range byCue {
+		cueIDs = append(cueIDs, cueID)
+	}
+	cues, err := s.cues.ByIDs(cueIDs)
+	if err != nil {
+		return err
+	}
+	device, err := s.devices.Get(deviceID)
+	if err != nil {
+		return err
+	}
+	for _, cue := range cues {
+		oldVersion := byCue[cue.ID]
+		summary := util.SummaryJSON(map[string]any{
+			"device_id": deviceID, "device_code": device.DeviceCode, "device_version_old": oldVersion, "device_version_new": newVersion,
+			"cue_id": cue.ID, "cue_code": cue.CueCode, "cue_version": cue.Version, "cue_status": cue.CueStatus,
+			"effect":   "cue device version lock invalidated; historical approval and rehearsal runs retained; lock/rehearsal blocked until same content is re-approved",
+			"boundary": "offline rehearsal evidence only; no machinery command or operational clearance",
+		})
+		event := audit.NewEvent(actor, "rigging_device.invalidates_cue_lock", "cue_definition", cue.ID, "{}", summary)
+		if err := s.devices.RecordAudit(event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *RiggingDeviceService) changeSummary(current model.RiggingDevice, request dto.UpdateRiggingDeviceRequest) (bool, string, string) {
+	before := util.SummaryJSON(map[string]any{"limits": map[string]any{"max_load_kg": current.MaxLoadKG, "max_speed_ms": current.MaxSpeedMS, "travel_min_m": current.TravelMinM, "travel_max_m": current.TravelMaxM}, "safety_zone": current.SafetyZone, "status": current.DeviceStatus, "version": current.Version})
+	after := util.SummaryJSON(map[string]any{"limits": map[string]any{"max_load_kg": request.MaxLoadKG, "max_speed_ms": request.MaxSpeedMS, "travel_min_m": request.TravelMinM, "travel_max_m": request.TravelMaxM}, "safety_zone": strings.ToLower(strings.TrimSpace(request.SafetyZone)), "status": request.DeviceStatus, "version": request.Version + 1})
+	changed := current.MaxLoadKG != request.MaxLoadKG || current.MaxSpeedMS != request.MaxSpeedMS || current.TravelMinM != request.TravelMinM || current.TravelMaxM != request.TravelMaxM || current.SafetyZone != strings.ToLower(strings.TrimSpace(request.SafetyZone)) || current.DeviceStatus != request.DeviceStatus
+	return changed, before, after
 }
 
 func (s *RiggingDeviceService) withRules(item model.RiggingDevice) (dto.RiggingDeviceResponse, error) {
